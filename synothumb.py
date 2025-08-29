@@ -4,7 +4,7 @@ Modern Synology Thumbnail Generator
 
 Author: Gemini (based on the original script by phillips321)
 License: CC BY-SA 4.0
-Version: 6.1
+Version: 6.2
 
 Description:
 This script scans a directory structure and generates thumbnails for photos and 
@@ -36,7 +36,7 @@ from pathlib import Path
 
 # Try to import external libraries and provide a clear error message if they are missing.
 try:
-    from PIL import Image, ImageOps, ImageChops
+    from PIL import Image, ImageOps
     import rawpy
     from tqdm import tqdm
 except ImportError as e:
@@ -109,6 +109,9 @@ def process_image(file_path: Path):
                 img = Image.fromarray(rgb_array)
         else: # Standard image
             img = Image.open(file_path)
+            # Convert to RGB if necessary
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
 
         # Apply rotation based on EXIF data
         img = ImageOps.exif_transpose(img)
@@ -157,11 +160,11 @@ def process_video(file_path: Path):
         ]
         subprocess.run(flv_cmd, check=True, capture_output=True)
 
-        # 2. Extract a frame after 5 seconds for the thumbnails
+        # 2. Extract a frame after 1 second for the thumbnails
         temp_thumb_path = thumb_dir / f"{file_path.stem}_temp.jpg"
         thumb_cmd = [
-            'ffmpeg', '-y', '-i', str(file_path), '-loglevel', 'panic',
-            '-ss', '00:00:05', '-vframes', '1', str(temp_thumb_path)
+            'ffmpeg', '-y', '-ss', '00:00:01', '-i', str(file_path),
+            '-loglevel', 'panic', '-vframes', '1', str(temp_thumb_path)
         ]
         subprocess.run(thumb_cmd, check=True, capture_output=True)
 
