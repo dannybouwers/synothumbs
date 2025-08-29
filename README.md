@@ -6,7 +6,7 @@ The entire codebase has been rewritten in Python 3 using modern libraries to imp
 
 ## Features
 
-- **High-Performance Multithreading:**** Uses a modern `ThreadPoolExecutor` to process multiple files concurrently, significantly speeding up the generation process.
+- **High-Performance Multithreading:** Uses a modern `ThreadPoolExecutor` to process multiple files concurrently, significantly speeding up the generation process.
 - **Dynamic Thread Management:** Automatically determines the optimal number of threads to use based on your system's CPU cores.
 - **Extensive RAW Format Support:** Natively supports a wide range of camera RAW formats (e.g., `.NEF`, `.CR3`, `.ARW`, `.DNG`) using the powerful rawpy library, eliminating the need for an external dcraw executable.
 - **Broad Video Format Support:** Handles all common video formats using `ffmpeg` for thumbnail extraction and video processing.
