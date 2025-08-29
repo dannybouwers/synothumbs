@@ -1,237 +1,248 @@
-#!/usr/bin/env python
-# sudo mount_nfs -P 192.168.0.2:/volume1/photo /Users/phillips321/nfsmount
-# Author:       phillips321
-# License:      CC BY-SA 3.0
-# Use:          home use only, commercial use by permission only
-# Released:     www.phillips321.co.uk
-# Dependencies: PIL, libjpeg, libpng, dcraw, ffmpeg
-# Supports:     jpg, bmp, png, tif
-# Version:      5.0
-# ChangeLog:
-#       v5.0 - addition of PREVIEW thumbnail type; check for proper video conversion command
-#       v4.0 - addition of autorate (thanks Markus Luisser)
-#       v3.1 - filename fix (_ instead of :) and improvement of rendering (antialias and quality=90 - thanks to alkopedia)
-#       v3.0 - Video support 
-#       v2.1 - CR2 raw support
-#       v2.0 - multithreaded
-#       v1.0 - First release
-# ToDo:
-#       add more raw formats
-#       add more movie formats
-import os,sys,Image,Queue,threading,time,subprocess,shlex,ImageChops
+# -*- coding: utf-8 -*-
+"""
+Modern Synology Thumbnail Generator
 
+Author: Gemini (based on the original script by phillips321)
+License: CC BY-SA 4.0
+Version: 6.1
+
+Description:
+This script scans a directory structure and generates thumbnails for photos and 
+videos, compatible with Synology Photo Station / Synology Photos.
+
+This modernized version includes the following improvements:
+- Uses concurrent.futures for modern and efficient multithreading.
+- Automatically determines the optimal number of threads based on CPU cores.
+- Extended support for RAW formats (NEF, DNG, ARW, etc.) via the 'rawpy' library.
+- Extended support for common video formats.
+- Logging is written to a unique, timestamped log file instead of the terminal.
+- A TQDM progress bar shows the progress in the terminal.
+- Uses modern libraries like Pillow, rawpy, and tqdm.
+- Utilizes pathlib for more robust file and path manipulation.
+
+Requirements:
+- Python 3.6+
+- External commands: 'ffmpeg' must be installed and available in the system's PATH.
+- Python packages: see requirements.txt (pip install -r requirements.txt)
+"""
+
+import os
+import sys
+import subprocess
+import logging
+import concurrent.futures
+from datetime import datetime
+from pathlib import Path
+
+# Try to import external libraries and provide a clear error message if they are missing.
 try:
-    from cStringIO import StringIO
-except:
-    from StringIO import StringIO
+    from PIL import Image, ImageOps, ImageChops
+    import rawpy
+    from tqdm import tqdm
+except ImportError as e:
+    print(f"Error: A required library is missing: {e.name}")
+    print("Please install the required packages using: pip install -r requirements.txt")
+    sys.exit(1)
 
+# --- Configuration ---
 
-#########################################################################
-# Settings
-#########################################################################
-NumOfThreads=8  # Number of threads
-startTime=time.time()
-imageExtensions=['.jpg','.png','.jpeg','.tif','.bmp','.cr2'] #possibly add other raw types?
-videoExtensions=['.mov','.m4v','mp4']
-xlName="SYNOPHOTO_THUMB_XL.jpg" ; xlSize=(1280,1280) #XtraLarge
-lName="SYNOPHOTO_THUMB_L.jpg" ; lSize=(800,800) #Large
-bName="SYNOPHOTO_THUMB_B.jpg" ; bSize=(640,640) #Big
-mName="SYNOPHOTO_THUMB_M.jpg" ; mSize=(320,320) #Medium
-sName="SYNOPHOTO_THUMB_S.jpg" ; sSize=(160,160) #Small
-pName="SYNOPHOTO_THUMB_PREVIEW.jpg" ; pSize=(120,160) #Preview, keep ratio, pad with black
+# Define thumbnail sizes and filenames.
+THUMBNAIL_CONFIG = {
+    "SYNOPHOTO_THUMB_XL.jpg": (1280, 1280),
+    "SYNOPHOTO_THUMB_L.jpg": (800, 800),
+    "SYNOPHOTO_THUMB_B.jpg": (640, 640),
+    "SYNOPHOTO_THUMB_M.jpg": (320, 320),
+    "SYNOPHOTO_THUMB_S.jpg": (160, 160),
+}
+# Special configuration for the preview thumbnail
+PREVIEW_CONFIG = {
+    "name": "SYNOPHOTO_THUMB_PREVIEW.jpg",
+    "size": (120, 120) # Adjusted to square for simpler padding
+}
 
-#########################################################################
-# Images Class
-#########################################################################
-class convertImage(threading.Thread):
-    def __init__(self,queueIMG):
-        threading.Thread.__init__(self)
-        self.queueIMG=queueIMG
+# Supported file formats
+# rawpy supports most RAW formats from all major brands.
+IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff']
+RAW_EXTENSIONS = ['.arw', '.cr2', '.cr3', '.crw', '.dng', '.erf', '.nef', '.nrw', '.orf', '.pef', '.raf', '.raw', '.rw2', '.sr2', '.srf', '.x3f']
+VIDEO_EXTENSIONS = ['.mov', '.m4v', '.mp4', '.avi', '.mkv', '.mpg', '.mpeg', '.wmv', '.3gp', '.flv']
 
-    def run(self):
-        while True:
-            self.imagePath=self.queueIMG.get()
-            self.imageDir,self.imageName = os.path.split(self.imagePath)
-            self.thumbDir=os.path.join(self.imageDir,"@eaDir",self.imageName)
-            print "\t[-]Now working on %s" % (self.imagePath)
-            if os.path.isfile(os.path.join(self.thumbDir,xlName)) != 1:
-                if os.path.isdir(self.thumbDir) != 1:
-                    try:os.makedirs(self.thumbDir)
-                    except:continue
-                
-                #Following if statements converts raw images using dcraw first
-                if os.path.splitext(self.imagePath)[1].lower() == ".cr2":
-                    self.dcrawcmd = "dcraw -c -b 8 -q 0 -w -H 5 '%s'" % self.imagePath
-                    self.dcraw_proc = subprocess.Popen(shlex.split(self.dcrawcmd), stdout=subprocess.PIPE)
-                    self.raw = StringIO(self.dcraw_proc.communicate()[0])
-                    self.image=Image.open(self.raw)
-                else:
-                    self.image=Image.open(self.imagePath)
+# --- Logging Setup ---
 
-                ###### Check image orientation and rotate if necessary
-                ## code adapted from: http://www.lifl.fr/~riquetd/auto-rotating-pictures-using-pil.html
-                self.exif = self.image._getexif()
+def setup_logging():
+    """Configures logging to write to a file."""
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_filename = log_dir / f"synothumb_{timestamp}.log"
     
-                if not self.exif:
-                    return False
-            
-                self.orientation_key = 274 # cf ExifTags
-                if self.orientation_key in self.exif:
-                    self.orientation = self.exif[self.orientation_key]
-            
-                    rotate_values = {
-                        3: 180,
-                        6: 270,
-                        8: 90
-                    }
-            
-                    if self.orientation in rotate_values:
-                        self.image=self.image.rotate(rotate_values[self.orientation])
-
-                #### end of orientation part
-
-                self.image.thumbnail(xlSize, Image.ANTIALIAS)
-                self.image.save(os.path.join(self.thumbDir,xlName), quality=90)
-                self.image.thumbnail(lSize, Image.ANTIALIAS)
-                self.image.save(os.path.join(self.thumbDir,lName), quality=90)
-                self.image.thumbnail(bSize, Image.ANTIALIAS)
-                self.image.save(os.path.join(self.thumbDir,bName), quality=90)
-                self.image.thumbnail(mSize, Image.ANTIALIAS)
-                self.image.save(os.path.join(self.thumbDir,mName), quality=90)
-                self.image.thumbnail(sSize, Image.ANTIALIAS)
-                self.image.save(os.path.join(self.thumbDir,sName), quality=90)
-                self.image.thumbnail(pSize, Image.ANTIALIAS)
-                # pad out image
-                self.image_size = self.image.size
-                self.preview_img = self.image.crop((0, 0, pSize[0], pSize[1]))
-                self.offset_x = max((pSize[0] - self.image_size[0]) / 2, 0)
-                self.offset_y = max((pSize[1] - self.image_size[1]) / 2, 0)
-                self.preview_img = ImageChops.offset(self.preview_img, self.offset_x, self.offset_y)
-                self.preview_img.save(os.path.join(self.thumbDir,pName), quality=90)
-            self.queueIMG.task_done()
-
-#########################################################################
-# Video Class
-#########################################################################
-class convertVideo(threading.Thread):
-    def __init__(self,queueVID):
-        threading.Thread.__init__(self)
-        self.queueVID=queueVID
-
-    def is_tool(self, name):
-        try:
-            devnull = open(os.devnull)
-            subprocess.Popen([name], stdout=devnull, stderr=devnull).communicate()
-        except OSError as e:
-            if e.errno == os.errno.ENOENT:
-                return False
-        return True
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        filename=log_filename,
+        filemode='w'
+    )
+    # Also add a handler to send errors to the console
+    console_handler = logging.StreamHandler(sys.stderr)
+    console_handler.setLevel(logging.ERROR)
+    logging.getLogger().addHandler(console_handler)
     
-    def run(self):
-        while True:
-            self.videoPath=self.queueVID.get()
-            self.videoDir,self.videoName = os.path.split(self.videoPath)
-            self.thumbDir=os.path.join(self.videoDir,"@eaDir",self.videoName)
-            if os.path.isfile(os.path.join(self.thumbDir,xlName)) != 1:
-                print "Now working on %s" % (self.videoPath)
-                if os.path.isdir(self.thumbDir) != 1:
-                    try:os.makedirs(self.thumbDir)
-                    except:continue
-		# Check video conversion command and convert video to flv
-                if self.is_tool("ffmpeg"):
-			self.ffmpegcmd = "ffmpeg -loglevel panic -i '%s' -y -ar 44100 -r 12 -ac 2 -f flv -qscale 5 -s 320x180 -aspect 320:180 '%s/SYNOPHOTO:FILM.flv'" % (self.videoPath,self.thumbDir) # ffmpeg replaced by avconv on ubuntu
-                elif self.is_tool("avconv"):
-			self.ffmpegcmd = "avconv -loglevel panic -i '%s' -y -ar 44100 -r 12 -ac 2 -f flv -qscale 5 -s 320x180 -aspect 320:180 '%s/SYNOPHOTO:FILM.flv'" % (self.videoPath,self.thumbDir)
-                else: return False
-                self.ffmpegproc = subprocess.Popen(shlex.split(self.ffmpegcmd), stdout=subprocess.PIPE)
-                self.ffmpegproc.communicate()[0]
-            
-                # Create video thumbs
-                self.tempThumb=os.path.join("/tmp",os.path.splitext(self.videoName)[0]+".jpg")
-                if self.is_tool("ffmpeg"):
-			self.ffmpegcmdThumb = "ffmpeg -loglevel panic -i '%s' -y -an -ss 00:00:03 -an -r 1 -vframes 1 '%s'" % (self.videoPath,self.tempThumb) # ffmpeg replaced by avconv on ubuntu
-                elif self.is_tool("avconv"):
-			self.ffmpegcmdThumb = "avconv -loglevel panic -i '%s' -y -an -ss 00:00:03 -an -r 1 -vframes 1 '%s'" % (self.videoPath,self.tempThumb)
-                else: return False
-                self.ffmpegThumbproc = subprocess.Popen(shlex.split(self.ffmpegcmdThumb), stdout=subprocess.PIPE)
-                self.ffmpegThumbproc.communicate()[0]
-                self.image=Image.open(self.tempThumb)
-                self.image.thumbnail(xlSize)
-                self.image.save(os.path.join(self.thumbDir,xlName))
-                self.image.thumbnail(mSize)
-                self.image.save(os.path.join(self.thumbDir,mName))
-            
-            self.queueVID.task_done()
+    return log_filename
 
-#########################################################################
-# Main
-#########################################################################
-def main():
-    queueIMG = Queue.Queue()
-    queueVID = Queue.Queue()
+# --- Media Processing Functions ---
+
+def process_image(file_path: Path):
+    """Generates thumbnails for a single image file (standard or RAW)."""
     try:
-        rootdir=sys.argv[1]
-    except:
-        print "Usage: %s directory" % sys.argv[0]
+        thumb_dir = file_path.parent / "@eaDir" / file_path.name
+        
+        # Check if the XL thumbnail already exists, then skip.
+        if (thumb_dir / list(THUMBNAIL_CONFIG.keys())[0]).exists():
+            return f"Skipped (already exists): {file_path.name}"
+            
+        thumb_dir.mkdir(parents=True, exist_ok=True)
+        
+        img = None
+        if file_path.suffix.lower() in RAW_EXTENSIONS:
+            with rawpy.imread(str(file_path)) as raw:
+                # Postprocess the RAW data into an RGB image array
+                rgb_array = raw.postprocess(use_camera_wb=True, output_bps=8)
+                img = Image.fromarray(rgb_array)
+        else: # Standard image
+            img = Image.open(file_path)
+
+        # Apply rotation based on EXIF data
+        img = ImageOps.exif_transpose(img)
+
+        # Generate all standard thumbnails
+        for name, size in THUMBNAIL_CONFIG.items():
+            img_copy = img.copy()
+            img_copy.thumbnail(size, Image.Resampling.LANCZOS)
+            img_copy.save(thumb_dir / name, "JPEG", quality=95)
+
+        # Generate the special preview thumbnail with padding
+        p_name = PREVIEW_CONFIG['name']
+        p_size = PREVIEW_CONFIG['size']
+        img_copy = img.copy()
+        img_copy.thumbnail(p_size, Image.Resampling.LANCZOS)
+        
+        # Add black padding to make it square
+        padded_img = Image.new("RGB", p_size, (0, 0, 0))
+        paste_pos = ((p_size[0] - img_copy.width) // 2, (p_size[1] - img_copy.height) // 2)
+        padded_img.paste(img_copy, paste_pos)
+        padded_img.save(thumb_dir / p_name, "JPEG", quality=90)
+        
+        return f"Image processed: {file_path.name}"
+
+    except Exception as e:
+        logging.error(f"Error processing image {file_path}: {e}")
+        return f"Error: {file_path.name}"
+
+def process_video(file_path: Path):
+    """Generates a video filmstrip and thumbnails for a video file."""
+    try:
+        thumb_dir = file_path.parent / "@eaDir" / file_path.name
+        
+        # Check if the XL thumbnail already exists, then skip.
+        if (thumb_dir / list(THUMBNAIL_CONFIG.keys())[0]).exists():
+            return f"Skipped (already exists): {file_path.name}"
+            
+        thumb_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 1. Generate the FLV filmstrip (optional, for older Synology versions)
+        film_flv_path = thumb_dir / "SYNOPHOTO:FILM.flv"
+        flv_cmd = [
+            'ffmpeg', '-y', '-i', str(file_path), '-loglevel', 'panic',
+            '-ar', '44100', '-r', '12', '-ac', '2', '-f', 'flv',
+            '-qscale', '5', '-s', '320x180', str(film_flv_path)
+        ]
+        subprocess.run(flv_cmd, check=True, capture_output=True)
+
+        # 2. Extract a frame after 5 seconds for the thumbnails
+        temp_thumb_path = thumb_dir / f"{file_path.stem}_temp.jpg"
+        thumb_cmd = [
+            'ffmpeg', '-y', '-i', str(file_path), '-loglevel', 'panic',
+            '-ss', '00:00:05', '-vframes', '1', str(temp_thumb_path)
+        ]
+        subprocess.run(thumb_cmd, check=True, capture_output=True)
+
+        if not temp_thumb_path.exists():
+            raise FileNotFoundError("FFmpeg failed to extract a thumbnail frame.")
+
+        # 3. Generate the different thumbnail sizes from the frame
+        with Image.open(temp_thumb_path) as img:
+            for name, size in THUMBNAIL_CONFIG.items():
+                img_copy = img.copy()
+                img_copy.thumbnail(size, Image.Resampling.LANCZOS)
+                img_copy.save(thumb_dir / name, "JPEG", quality=95)
+        
+        # Delete the temporary frame
+        temp_thumb_path.unlink()
+
+        return f"Video processed: {file_path.name}"
+        
+    except subprocess.CalledProcessError as e:
+        error_message = e.stderr.decode('utf-8', errors='ignore').strip()
+        logging.error(f"FFmpeg error while processing video {file_path}: {error_message}")
+        return f"FFmpeg Error: {file_path.name}"
+    except Exception as e:
+        logging.error(f"Error processing video {file_path}: {e}")
+        return f"Error: {file_path.name}"
+
+# --- Main Function ---
+
+def main():
+    """Finds media, sets up threads, and starts the process."""
+    if len(sys.argv) < 2:
+        print(f"Usage: python {sys.argv[0]} <path_to_photos_or_videos>")
+        sys.exit(1)
+        
+    root_dir = Path(sys.argv[1])
+    if not root_dir.is_dir():
+        print(f"Error: The directory '{root_dir}' does not exist.")
+        sys.exit(1)
+
+    log_filename = setup_logging()
+    print(f"Logging has started. Details are being saved to: {log_filename}")
+    logging.info(f"Script started in directory: {root_dir}")
+
+    print("Searching for media files (this might take a while)...")
+    all_extensions = IMAGE_EXTENSIONS + RAW_EXTENSIONS + VIDEO_EXTENSIONS
+    media_files = [
+        f for f in root_dir.rglob('*') 
+        if f.suffix.lower() in all_extensions and "@eaDir" not in str(f.parent)
+    ]
+    
+    if not media_files:
+        print("No media files found to process.")
+        logging.info("No media files found.")
         sys.exit(0)
 
-    # Finds all images of type in extensions array
-    imageList=[]
-    print "[+] Looking for images and populating queue (This might take a while...)"
-    for path, subFolders, files in os.walk(rootdir):
-        for file in files:
-            ext=os.path.splitext(file)[1].lower()
-            if any(x in ext for x in imageExtensions):#check if extensions matches ext
-                if "@eaDir" not in path:
-                    if file != ".DS_Store" and file != ".apdisk" and file != "Thumbs.db": # maybe remove
-                        imageList.append(os.path.join(path,file))
+    print(f"Found {len(media_files)} media files.")
+    logging.info(f"Found {len(media_files)} media files to process.")
 
-    print "[+] We have found %i images in search directory" % len(imageList)
-    raw_input("\tPress Enter to continue or Ctrl-C to quit")
+    # Determine the number of threads (CPU cores, with a max of 32 for I/O-bound tasks)
+    max_workers = min(32, (os.cpu_count() or 1) + 4)
+    logging.info(f"Using {max_workers} threads.")
 
-    #spawn a pool of threads
-    for i in range(NumOfThreads): #number of threads
-        t=convertImage(queueIMG)
-        t.setDaemon(True)
-        t.start()
+    tasks = []
+    for file_path in media_files:
+        if file_path.suffix.lower() in VIDEO_EXTENSIONS:
+            tasks.append((process_video, file_path))
+        else:
+            tasks.append((process_image, file_path))
 
-    # populate queue with Images
-    for imagePath in imageList:
-        queueIMG.put(imagePath)
+    with tqdm(total=len(tasks), desc="Generating thumbnails", unit="file") as pbar:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_task = {executor.submit(func, path): (func, path) for func, path in tasks}
+            
+            for future in concurrent.futures.as_completed(future_to_task):
+                result = future.result()
+                logging.info(result)
+                pbar.update(1)
 
-    queueIMG.join()
+    print("\nAll tasks completed.")
+    logging.info("Script finished successfully.")
 
-
-    # Finds all videos of type in extensions array
-    videoList=[]
-    print "[+] Looking for videos and populating queue (This might take a while...)"
-    for path, subFolders, files in os.walk(rootdir):
-        for file in files:
-            ext=os.path.splitext(file)[1].lower()
-            if any(x in ext for x in videoExtensions):#check if extensions matches ext
-                if "@eaDir" not in path:
-                    if file != ".DS_Store" and file != ".apdisk" and file != "Thumbs.db": #maybe remove?
-                        videoList.append(os.path.join(path,file))
-
-    print "[+] We have found %i videos in search directory" % len(videoList)
-    raw_input("\tPress Enter to continue or Ctrl-C to quit")
-
-    #spawn a pool of threads
-    for i in range(NumOfThreads): #number of threads
-        v=convertVideo(queueVID)
-        v.setDaemon(True)
-        v.start()
-
-    # populate queueVID with Images
-    for videoPath in videoList:
-        queueVID.put(videoPath) # could we possibly put this instead of videoList.append(os.path.join(path,file))
-
-    queueVID.join()
-
-    endTime=time.time()
-    print "Time to complete %i" % (endTime-startTime)
-
-    sys.exit(0)
 
 if __name__ == "__main__":
     main()
